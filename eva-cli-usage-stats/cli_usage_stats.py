@@ -56,6 +56,14 @@ def write_csv(output_dir, filename, header, rows):
         writer.writerows(rows)
     logger.info(f"Written {path}")
 
+def extract_exception_name(stacktrace):
+    """Extract the exception name from a stacktrace."""
+    last_line = next(
+        (line.strip() for line in reversed(stacktrace.splitlines()) if line.strip()),
+        'unknown'
+    )
+    return last_line.split(':')[0].strip()
+
 
 class CLIUsageStats:
 
@@ -243,11 +251,7 @@ class CLIUsageStats:
         for (json_payload,) in raw:
             try:
                 stacktrace = json_payload.get('exceptionStacktrace') or ''
-                last_line = next(
-                    (line.strip() for line in reversed(stacktrace.splitlines()) if line.strip()),
-                    'unknown'
-                )
-                counts[last_line.split(':')[0].strip()] += 1
+                counts[extract_exception_name(stacktrace)] += 1
             except (json.JSONDecodeError, AttributeError):
                 counts['(unparseable payload)'] += 1
         return sorted(counts.items(), key=lambda x: -x[1])
