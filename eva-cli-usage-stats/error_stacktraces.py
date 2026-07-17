@@ -13,17 +13,29 @@
 # limitations under the License.
 
 import argparse
+import os
+import re
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from functools import cached_property
 
 from ebi_eva_common_pyutils.logger import logging_config
 from ebi_eva_internal_pyutils.metadata_utils import get_metadata_connection_handle
-from cli_usage_stats import extract_exception_name
+from cli_usage_stats import extract_exception_name, write_csv
 
 logger = logging_config.get_logger(__name__)
 
 TABLE_NAME = 'eva_submissions.call_home_event'
+
+EVA_SUB_CLI_GITHUB_URL = 'https://github.com/EBIvariation/eva-sub-cli'
+EVA_SUB_CLI_GITHUB_BRANCH = 'main'
+EVA_SUB_CLI_FRAME_PATTERN = re.compile(r'File "(/eva_sub_cli/[^"]+)", line (\d+)')
+
+CSV_HEADER = [
+    'Error type', 'eva-sub-cli versions', 'Number of event', 'Count run', 'Count deployment',
+    'Link to Github repository', 'Bug Type', 'Impact', 'Comment',
+]
+
 
 def remove_path_from_lines(line):
     result = []
@@ -35,11 +47,28 @@ def remove_path_from_lines(line):
             result.append(token)
     return ' '.join(result)
 
+
 def load_excluded_deployment_ids(path):
     if not path:
         return set()
     with open(path) as f:
         return {line.strip() for line in f if line.strip()}
+
+
+def github_link_from_stacktrace(stacktrace):
+    """Link to the eva_sub_cli source line of the last /eva_sub_cli/ frame in the stacktrace."""
+    matches = EVA_SUB_CLI_FRAME_PATTERN.findall(stacktrace)
+    if not matches:
+        return ''
+    path, line = matches[-1]
+    return f"{EVA_SUB_CLI_GITHUB_URL}/blob/{EVA_SUB_CLI_GITHUB_BRANCH}{path}#L{line}"
+
+
+def version_sort_key(version):
+    try:
+        return 0, tuple(int(part) for part in version.split('.'))
+    except ValueError:
+        return 1, version
 
 
 class ErrorStacktraceReporter:
@@ -65,7 +94,7 @@ class ErrorStacktraceReporter:
 
     def failures(self):
         sql = f"""
-            SELECT run_id, deployment_id, created_at, raw_payload
+            SELECT run_id, deployment_id, created_at, cli_version, raw_payload
             FROM {TABLE_NAME}
             WHERE event_type = 'FAILURE'
               AND created_at >= %s
@@ -84,11 +113,11 @@ class ErrorStacktraceReporter:
             params.append(self.exclude_deployment_ids)
         return self.query(sql, tuple(params))
 
-    def print_failures(self):
+    def group_failures(self):
         rows = self.failures()
         logger.info(f"Found {len(rows)} matching FAILURE event(s)")
         exception_dict = defaultdict(list)
-        for run_id, deployment_id, created_at, raw_payload in rows:
+        for run_id, deployment_id, created_at, cli_version, raw_payload in rows:
             try:
                 stacktrace = raw_payload.get('exceptionStacktrace') or '(no stacktrace available)'
                 exception_name, exception_line = extract_exception_name(stacktrace)
@@ -101,18 +130,46 @@ class ErrorStacktraceReporter:
                 'created_at': created_at,
                 'deployment_id': deployment_id,
                 'run_id': run_id,
+                'cli_version': cli_version,
                 'stacktrace': stacktrace
             })
-        for exception_name, exception_line in sorted(exception_dict):
-            exceptions = exception_dict[(exception_name, exception_line)]
-            print(f"NEW TYPE: {exception_line} {len(exceptions)} events")
-            for exception in exceptions:
-                print('=' * 80)
-                print(f"Date: {exception['created_at']}")
-                print(f"Deployment ID: {exception['deployment_id']}")
-                print(f"Run ID: {exception['run_id']}")
-                print('-' * 80)
-                print(exception['stacktrace'])
+        return exception_dict
+
+    def write_stacktraces_file(self, exception_dict, output_dir, groups_by_frequency):
+        path = os.path.join(output_dir, 'error_stacktraces.txt')
+        with open(path, 'w') as open_file:
+            for exception_name, exception_line in groups_by_frequency:
+                events = exception_dict[(exception_name, exception_line)]
+                open_file.write(f"NEW TYPE: {exception_line} {len(events)} events\n")
+                for event in events:
+                    open_file.write('=' * 80 + '\n')
+                    open_file.write(f"Date: {event['created_at']}\n")
+                    open_file.write(f"Deployment ID: {event['deployment_id']}\n")
+                    open_file.write(f"Run ID: {event['run_id']}\n")
+                    open_file.write(f"CLI Version: {event['cli_version']}\n")
+                    open_file.write('-' * 80 + '\n')
+                    open_file.write(event['stacktrace'] + '\n\n')
+        logger.info(f"Written {path}")
+
+    def write_summary_csv(self, exception_dict, output_dir, groups_by_frequency):
+        rows = []
+        for exception_name, exception_line in groups_by_frequency:
+            events = exception_dict[(exception_name, exception_line)]
+            versions = sorted({e['cli_version'] for e in events}, key=version_sort_key)
+            count_run = len({e['run_id'] for e in events})
+            count_deployment = len({e['deployment_id'] for e in events})
+            link = github_link_from_stacktrace(events[0]['stacktrace'])
+            rows.append((exception_line, ', '.join(versions), len(events), count_run, count_deployment,
+                         link, '', '', ''))
+            logger.info(f"{exception_line}: {len(events)} events")
+        write_csv(output_dir, 'error_summary.csv', CSV_HEADER, rows)
+
+    def report(self, output_dir):
+        exception_dict = self.group_failures()
+        exception_dict_by_frequency = sorted(exception_dict, key=lambda key: -len(exception_dict[key]))
+        os.makedirs(output_dir, exist_ok=True)
+        self.write_stacktraces_file(exception_dict, output_dir, exception_dict_by_frequency)
+        self.write_summary_csv(exception_dict, output_dir, exception_dict_by_frequency)
 
 
 def parse_date(value):
@@ -120,11 +177,14 @@ def parse_date(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Print full stacktraces of recent CLI errors.')
+    parser = argparse.ArgumentParser(description='Report full stacktraces of recent CLI errors.')
     parser.add_argument('--private_config_xml_file', required=True,
                         help='Path to the Maven settings XML file with database credentials.')
     parser.add_argument('--profile', default='production_processing',
                         help='Profile name in the Maven settings XML (default: production_processing).')
+    parser.add_argument('--output-dir', default='.',
+                        help='Directory where error_stacktraces.txt and error_summary.csv will be '
+                             'written (default: current directory).')
     parser.add_argument('--start-date', type=parse_date,
                         help='Only include errors on or after this date (YYYY-MM-DD). '
                              'Defaults to 14 days ago.')
@@ -155,7 +215,7 @@ def main():
         run_ids=args.run_ids,
         deployment_ids=args.deployment_ids,
         exclude_deployment_ids=list(excluded_ids) if excluded_ids else None,
-    ).print_failures()
+    ).report(args.output_dir)
 
 
 if __name__ == '__main__':
