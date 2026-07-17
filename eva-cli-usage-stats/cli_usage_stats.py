@@ -62,7 +62,7 @@ def extract_exception_name(stacktrace):
         (line.strip() for line in reversed(stacktrace.splitlines()) if line.strip()),
         'unknown'
     )
-    return last_line.split(':')[0].strip()
+    return last_line.split(':')[0].strip(), last_line.strip()
 
 
 class CLIUsageStats:
@@ -251,7 +251,8 @@ class CLIUsageStats:
         for (json_payload,) in raw:
             try:
                 stacktrace = json_payload.get('exceptionStacktrace') or ''
-                counts[extract_exception_name(stacktrace)] += 1
+                exception_name, exception_line = extract_exception_name(stacktrace)
+                counts[exception_name] += 1
             except (json.JSONDecodeError, AttributeError):
                 counts['(unparseable payload)'] += 1
         return sorted(counts.items(), key=lambda x: -x[1])

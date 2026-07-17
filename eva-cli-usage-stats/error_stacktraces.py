@@ -25,6 +25,15 @@ logger = logging_config.get_logger(__name__)
 
 TABLE_NAME = 'eva_submissions.call_home_event'
 
+def remove_path_from_lines(line):
+    result = []
+    sp_line = line.split()
+    for token in sp_line:
+        if token.count('/') > 1:
+            result.append('<path removed>')
+        else:
+            result.append(token)
+    return ' '.join(result)
 
 def load_excluded_deployment_ids(path):
     if not path:
@@ -82,18 +91,21 @@ class ErrorStacktraceReporter:
         for run_id, deployment_id, created_at, raw_payload in rows:
             try:
                 stacktrace = raw_payload.get('exceptionStacktrace') or '(no stacktrace available)'
-                exception_name = extract_exception_name(stacktrace)
+                exception_name, exception_line = extract_exception_name(stacktrace)
+                exception_line = remove_path_from_lines(exception_line)
             except AttributeError:
                 stacktrace = '(unparseable payload)'
                 exception_name = 'N/A'
-            exception_dict[exception_name].append({
+                exception_line = 'N/A'
+            exception_dict[(exception_name, exception_line)].append({
                 'created_at': created_at,
                 'deployment_id': deployment_id,
                 'run_id': run_id,
                 'stacktrace': stacktrace
             })
-        for exception_name, exceptions in exception_dict.items():
-            print(f"{exception_name}: {len(exceptions)} events")
+        for exception_name, exception_line in sorted(exception_dict):
+            exceptions = exception_dict[(exception_name, exception_line)]
+            print(f"NEW TYPE: {exception_line} {len(exceptions)} events")
             for exception in exceptions:
                 print('=' * 80)
                 print(f"Date: {exception['created_at']}")
